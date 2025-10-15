@@ -139,8 +139,8 @@ async def get_page_text() -> str:
         text = ' '.join(text.split())
 
         # Limit response size to avoid token overflow
-        if len(text) > 40000:
-            text = text[:40000] + "... [truncated]"
+        if len(text) > 50000:
+            text = text[:50000] + "... [truncated]"
 
         return text
 

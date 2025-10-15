@@ -405,6 +405,10 @@ ANTHROPIC_API_KEY=sk-...
 
 # MCP Server (if deployed separately)
 MCP_SERVER_URL=https://mcp.yourdomain.com/sse
+# --- or ---
+# Use the stdio transport (for local Docker images, etc.)
+# MCP_SERVER_COMMAND=docker
+# MCP_SERVER_ARGS=run -i --rm -e SEC_EDGAR_USER_AGENT="Jianxing Chen (jc6183@columbia.edu)" sec-edgar-mcp-local:latest
 
 # Optional: HTTPS Settings (defaults are secure)
 SESSION_COOKIE_SECURE=True

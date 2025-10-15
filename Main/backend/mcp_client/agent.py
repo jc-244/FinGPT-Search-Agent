@@ -1,10 +1,13 @@
 # backend/mcp_client/agent.py
 
+import json
 import os
+import shlex
 from typing import Optional, List
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from agents import Agent
+from agents.mcp import MCPServerSse, MCPServerStdio
 from agents.model_settings import ModelSettings
 import logging
 
@@ -154,6 +157,103 @@ async def create_fin_agent(model: str = "gpt-4o",
 
     # Build tools list
     tools: List = []
+
+    # Initialize MCP servers if configured
+    connected_mcp_servers: List = []
+    mcp_servers_for_agent: List = []
+
+    async def _cleanup_mcp_servers():
+        """Cleanup MCP servers that were connected before an initialization error."""
+        for server in connected_mcp_servers:
+            try:
+                await server.cleanup()
+            except Exception as cleanup_error:
+                logging.error(f"Error during MCP server cleanup: {cleanup_error}")
+
+    mcp_url_env = os.getenv("MCP_SERVER_URL", "").strip()
+    if mcp_url_env:
+        headers = None
+        headers_json = os.getenv("MCP_SERVER_HEADERS_JSON", "").strip()
+        if headers_json:
+            try:
+                headers = json.loads(headers_json)
+            except json.JSONDecodeError as decode_error:
+                logging.error(f"Failed to parse MCP_SERVER_HEADERS_JSON: {decode_error}")
+
+        timeout = os.getenv("MCP_SERVER_TIMEOUT")
+        sse_read_timeout = os.getenv("MCP_SERVER_SSE_READ_TIMEOUT")
+
+        for url in [value.strip() for value in mcp_url_env.split(",") if value.strip()]:
+            params = {"url": url}
+            if headers:
+                params["headers"] = headers
+            if timeout:
+                try:
+                    params["timeout"] = float(timeout)
+                except ValueError:
+                    logging.error("MCP_SERVER_TIMEOUT must be a number of seconds; ignoring value.")
+            if sse_read_timeout:
+                try:
+                    params["sse_read_timeout"] = float(sse_read_timeout)
+                except ValueError:
+                    logging.error("MCP_SERVER_SSE_READ_TIMEOUT must be a number of seconds; ignoring value.")
+
+            server = MCPServerSse(params)
+            try:
+                await server.connect()
+                logging.info(f"Connected to MCP SSE server '{server.name}' ({url})")
+                connected_mcp_servers.append(server)
+            except Exception as connect_error:
+                logging.error(f"Failed to connect to MCP SSE server at {url}: {connect_error}")
+                await _cleanup_mcp_servers()
+                raise
+
+    mcp_command = os.getenv("MCP_SERVER_COMMAND", "").strip()
+    if mcp_command:
+        args_env = os.getenv("MCP_SERVER_ARGS", "").strip()
+        args = shlex.split(args_env) if args_env else []
+
+        env_json = os.getenv("MCP_SERVER_ENV_JSON", "").strip()
+        env_vars = None
+        if env_json:
+            try:
+                env_vars = json.loads(env_json)
+            except json.JSONDecodeError as decode_error:
+                logging.error(f"Failed to parse MCP_SERVER_ENV_JSON: {decode_error}")
+
+        cwd = os.getenv("MCP_SERVER_CWD", "").strip() or None
+        encoding = os.getenv("MCP_SERVER_ENCODING", "").strip() or None
+        encoding_error_handler = os.getenv("MCP_SERVER_ENCODING_ERROR_HANDLER", "").strip() or None
+
+        params = {"command": mcp_command}
+        if args:
+            params["args"] = args
+        if env_vars:
+            params["env"] = env_vars
+        if cwd:
+            params["cwd"] = cwd
+        if encoding:
+            params["encoding"] = encoding
+        if encoding_error_handler:
+            params["encoding_error_handler"] = encoding_error_handler
+
+        stdio_server = MCPServerStdio(params)
+        try:
+            await stdio_server.connect()
+            logging.info(f"Connected to MCP stdio server '{stdio_server.name}'")
+            if mcp_command == "docker" and any("sec-edgar-mcp" in arg for arg in ([mcp_command] + args)):
+                logging.info("[MCP DEBUG] Connected to SEC EDGAR MCP server via docker")
+            connected_mcp_servers.append(stdio_server)
+        except Exception as connect_error:
+            logging.error(
+                f"Failed to connect to MCP stdio server using command '{mcp_command}': {connect_error}"
+            )
+            await _cleanup_mcp_servers()
+            raise
+
+    if connected_mcp_servers:
+        mcp_servers_for_agent = connected_mcp_servers
+
     if use_playwright and PLAYWRIGHT_AVAILABLE:
         # Store domain restriction in global context for tools to access
         from . import playwright_tools
@@ -182,6 +282,7 @@ async def create_fin_agent(model: str = "gpt-4o",
             instructions=instructions,
             model=actual_model,  # Remember to use resolved model name, not frontend ID
             tools=tools if tools else [],
+            mcp_servers=mcp_servers_for_agent,
             model_settings=ModelSettings(
                 tool_choice="auto" if tools else None
             )
@@ -190,6 +291,16 @@ async def create_fin_agent(model: str = "gpt-4o",
         yield agent
 
     finally:
+        # Cleanup MCP servers
+        for server in connected_mcp_servers:
+            try:
+                await server.cleanup()
+                logging.info(f"Disconnected MCP server '{server.name}'")
+            except Exception as cleanup_error:
+                logging.error(
+                    f"Error disconnecting MCP server '{getattr(server, 'name', 'unknown')}': {cleanup_error}"
+                )
+
         # Cleanup browser if it was used
         if use_playwright and PLAYWRIGHT_AVAILABLE:
             try:
